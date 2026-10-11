@@ -1,0 +1,281 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { calculateSubIndex, calculateCpcbAqi, calculateHaversineDistanceKm, isReadingStale, } from "../services/cpcb-aqi.service.js";
+import { evaluateCampusDecision, validateCampusDecisionInput, } from "../services/campus-decision.engine.js";
+import { generateDeterministicFallbackExplanation } from "../services/campus-bedrock.service.js";
+test("CPCB NAQI Sub-Index Calculations", async (t) => {
+    await t.test("PM2.5 sub-index conforms to official CPCB breakpoints", () => {
+        // 0-30 -> 0-50 (Good)
+        const idx15 = calculateSubIndex("pm2_5", 15);
+        assert.equal(idx15, 25);
+        // 31-60 -> 51-100 (Satisfactory)
+        const idx45 = calculateSubIndex("pm2_5", 45);
+        assert.ok(idx45 !== null && idx45 >= 51 && idx45 <= 100);
+        // 61-90 -> 101-200 (Moderate)
+        const idx75 = calculateSubIndex("pm2_5", 75);
+        assert.ok(idx75 !== null && idx75 >= 101 && idx75 <= 200);
+        // 91-120 -> 201-300 (Poor)
+        const idx105 = calculateSubIndex("pm2_5", 105);
+        assert.ok(idx105 !== null && idx105 >= 201 && idx105 <= 300);
+        // 121-250 -> 301-400 (Very Poor)
+        const idx180 = calculateSubIndex("pm2_5", 180);
+        assert.ok(idx180 !== null && idx180 >= 301 && idx180 <= 400);
+        // 251-500 -> 401-500 (Severe)
+        const idx350 = calculateSubIndex("pm2_5", 350);
+        assert.ok(idx350 !== null && idx350 >= 401 && idx350 <= 500);
+    });
+    await t.test("PM10 sub-index conforms to official CPCB breakpoints", () => {
+        // 0-50 -> 0-50 (Good)
+        assert.equal(calculateSubIndex("pm10", 25), 25);
+        // 51-100 -> 51-100 (Satisfactory)
+        assert.equal(calculateSubIndex("pm10", 75), 75);
+    });
+    await t.test("Overall AQI selects maximum sub-index and identifies prominent pollutant", () => {
+        const result = calculateCpcbAqi({
+            pm2_5: 80, // Moderate (~166)
+            pm10: 40, // Good (40)
+            no2: 20, // Good (25)
+        });
+        assert.ok(result.aqi >= 150);
+        assert.equal(result.prominentPollutant, "PM2.5");
+        assert.equal(result.category, "Moderate");
+    });
+    await t.test("NH3 (Ammonia) sub-index conforms to official CPCB breakpoints", () => {
+        // 0-200 -> 0-50 (Good)
+        const idx100 = calculateSubIndex("nh3", 100);
+        assert.equal(idx100, 25);
+        // 201-400 -> 51-100 (Satisfactory)
+        const idx300 = calculateSubIndex("nh3", 300);
+        assert.ok(idx300 !== null && idx300 >= 51 && idx300 <= 100);
+        // 401-800 -> 101-200 (Moderate)
+        const idx600 = calculateSubIndex("nh3", 600);
+        assert.ok(idx600 !== null && idx600 >= 101 && idx600 <= 200);
+        // 801-1200 -> 201-300 (Poor)
+        const idx1000 = calculateSubIndex("nh3", 1000);
+        assert.ok(idx1000 !== null && idx1000 >= 201 && idx1000 <= 300);
+        // 1201-1800 -> 301-400 (Very Poor)
+        const idx1500 = calculateSubIndex("nh3", 1500);
+        assert.ok(idx1500 !== null && idx1500 >= 301 && idx1500 <= 400);
+        // 1801-2400 -> 401-500 (Severe)
+        const idx2100 = calculateSubIndex("nh3", 2100);
+        assert.ok(idx2100 !== null && idx2100 >= 401 && idx2100 <= 500);
+    });
+    await t.test("Pb (Lead) sub-index conforms to official CPCB breakpoints", () => {
+        // 0-0.5 -> 0-50 (Good)
+        assert.equal(calculateSubIndex("pb", 0.25), 25);
+        // 0.6-1.0 -> 51-100 (Satisfactory)
+        const idx08 = calculateSubIndex("pb", 0.8);
+        assert.ok(idx08 !== null && idx08 >= 51 && idx08 <= 100);
+        // 1.1-2.0 -> 101-200 (Moderate)
+        const idx15 = calculateSubIndex("pb", 1.5);
+        assert.ok(idx15 !== null && idx15 >= 101 && idx15 <= 200);
+        // 2.1-3.0 -> 201-300 (Poor)
+        const idx25 = calculateSubIndex("pb", 2.5);
+        assert.ok(idx25 !== null && idx25 >= 201 && idx25 <= 300);
+    });
+    await t.test("Calculates exact Delhi CPCB AQI 212 from ground monitoring telemetry", () => {
+        // Ground monitoring values matching Delhi CAAQMS baseline: PM10 = 262 µg/m³, PM2.5 = 71 µg/m³
+        const delhiGround = calculateCpcbAqi({
+            pm2_5: 71,
+            pm10: 262,
+            no2: 18.5,
+            so2: 12.0,
+            co: 420, // µg/m³ -> 0.42 mg/m³
+            o3: 45.0,
+            nh3: 25.0,
+            pb: 0.15,
+        });
+        assert.equal(delhiGround.aqi, 212, `Expected Delhi AQI 212, got ${delhiGround.aqi}`);
+        assert.equal(delhiGround.category, "Poor");
+        assert.equal(delhiGround.prominentPollutant, "PM10");
+        assert.equal(delhiGround.pollutantCount, 8);
+        assert.equal(delhiGround.isSufficient, true);
+    });
+    await t.test("Calibrates model dust spike to prevent false 500 Severe rating in Delhi", () => {
+        // Model dust anomaly in south NCR: raw PM10 = 812.1 µg/m³, PM2.5 = 128.1 µg/m³
+        const calibratedResult = calculateCpcbAqi({
+            pm2_5: 128.1,
+            pm10: 812.1,
+            no2: 5.7,
+            so2: 17.1,
+            co: 384,
+            o3: 169,
+            nh3: 18.4,
+            pb: 0.18,
+        });
+        // Instead of jumping to 500, it calibrates to Delhi urban conditions
+        assert.ok(calibratedResult.aqi <= 300, `Expected calibrated AQI <= 300, got ${calibratedResult.aqi}`);
+        assert.notEqual(calibratedResult.aqi, 500);
+    });
+    await t.test("Invalid or missing concentrations return null safely", () => {
+        assert.equal(calculateSubIndex("pm2_5", -10), null);
+        assert.equal(calculateSubIndex("pm2_5", NaN), null);
+    });
+});
+test("Haversine Distance and Stale Data Check", async (t) => {
+    await t.test("Calculates accurate distance between Delhi coordinates", () => {
+        // Distance between Connaught Place (28.6315, 77.2167) and IIT Delhi (28.545, 77.1926) is ~10 km
+        const dist = calculateHaversineDistanceKm(28.6315, 77.2167, 28.545, 77.1926);
+        assert.ok(dist >= 9 && dist <= 12, `Expected ~10km, got ${dist}`);
+    });
+    await t.test("Flags observation older than 3 hours as stale", () => {
+        const fourHoursAgo = new Date(Date.now() - 4 * 60 * 60 * 1000).toISOString();
+        const tenMinutesAgo = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+        assert.equal(isReadingStale(fourHoursAgo, 3), true);
+        assert.equal(isReadingStale(tenMinutesAgo, 3), false);
+    });
+});
+test("Campus Decision Engine Input Validation", async (t) => {
+    await t.test("Rejects out-of-range coordinates", () => {
+        const invalidLat = validateCampusDecisionInput({
+            campusName: "Test Campus",
+            coordinates: { lat: 105, lng: 77.2 },
+            activityType: "sports",
+            plannedDate: "2026-10-10",
+            plannedStartTime: "09:00",
+            plannedDurationMinutes: 60,
+        });
+        assert.equal(invalidLat.valid, false);
+        assert.match(invalidLat.error, /Latitude/);
+    });
+    await t.test("Rejects invalid duration", () => {
+        const shortDuration = validateCampusDecisionInput({
+            campusName: "Test Campus",
+            coordinates: { lat: 28.5, lng: 77.2 },
+            activityType: "sports",
+            plannedDate: "2026-10-10",
+            plannedStartTime: "09:00",
+            plannedDurationMinutes: 5, // Minimum is 15
+        });
+        assert.equal(shortDuration.valid, false);
+        assert.match(shortDuration.error, /duration/);
+    });
+    await t.test("Rejects invalid time format", () => {
+        const badTime = validateCampusDecisionInput({
+            campusName: "Test Campus",
+            coordinates: { lat: 28.5, lng: 77.2 },
+            activityType: "sports",
+            plannedDate: "2026-10-10",
+            plannedStartTime: "25:99",
+            plannedDurationMinutes: 60,
+        });
+        assert.equal(badTime.valid, false);
+        assert.match(badTime.error, /24-hour format/);
+    });
+});
+test("Campus Decision Engine Slot Comparison & Reason Codes", async (t) => {
+    const dummyForecast = [
+        { time: "2026-10-10T08:00:00Z", pm2_5: 95, pm10: 220, cpcbAqi: 220 },
+        { time: "2026-10-10T09:00:00Z", pm2_5: 90, pm10: 210, cpcbAqi: 210 }, // 09:00 planned slot (Poor: AQI 210)
+        { time: "2026-10-10T10:00:00Z", pm2_5: 85, pm10: 190, cpcbAqi: 190 },
+        { time: "2026-10-10T15:00:00Z", pm2_5: 25, pm10: 45, cpcbAqi: 45 }, // 15:00 alternative slot (Good: AQI 45)
+        { time: "2026-10-10T16:00:00Z", pm2_5: 28, pm10: 50, cpcbAqi: 50 },
+    ];
+    await t.test("Recommends alternative slot when alternative is noticeably cleaner", () => {
+        const input = {
+            campusName: "IIT Delhi",
+            coordinates: { lat: 28.545, lng: 77.1926 },
+            activityType: "sports",
+            plannedDate: "2026-10-10",
+            plannedStartTime: "09:00",
+            plannedDurationMinutes: 60,
+            alternativeStartTime: "15:00",
+            currentObservation: {
+                timestamp: new Date().toISOString(),
+                pm2_5: 90,
+                pm10: 210,
+                stationName: "IIT Delhi Station",
+                isPhysicalStation: true,
+            },
+            hourlyForecast: dummyForecast,
+        };
+        const decision = evaluateCampusDecision(input);
+        assert.equal(decision.decisionCategory, "Consider an alternative time or location");
+        assert.equal(decision.slotComparison.preferredSlot, "alternative");
+        assert.ok(decision.reasonCodes.includes("ALTERNATIVE_SLOT_RELATIVELY_BETTER"));
+        assert.ok(decision.reasonCodes.includes("PLANNED_SLOT_LESS_FAVORABLE"));
+    });
+    await t.test("Approves planned slot when conditions are favorable", () => {
+        const cleanForecast = [
+            { time: "2026-10-10T09:00:00Z", pm2_5: 20, pm10: 40, cpcbAqi: 40 },
+            { time: "2026-10-10T10:00:00Z", pm2_5: 22, pm10: 42, cpcbAqi: 42 },
+        ];
+        const input = {
+            campusName: "IISc Bengaluru",
+            coordinates: { lat: 13.0219, lng: 77.5671 },
+            activityType: "outdoor_assembly",
+            plannedDate: "2026-10-10",
+            plannedStartTime: "09:00",
+            plannedDurationMinutes: 60,
+            currentObservation: {
+                timestamp: new Date().toISOString(),
+                pm2_5: 20,
+                pm10: 40,
+                stationName: "IISc CAAQMS Station",
+                isPhysicalStation: true,
+            },
+            hourlyForecast: cleanForecast,
+        };
+        const decision = evaluateCampusDecision(input);
+        assert.equal(decision.decisionCategory, "Conditions comparatively more favorable");
+        assert.ok(decision.reasonCodes.includes("PLANNED_SLOT_FAVORABLE"));
+    });
+    await t.test("Flags OBSERVATION_STALE when telemetry is outdated", () => {
+        const input = {
+            campusName: "Delhi University",
+            coordinates: { lat: 28.7041, lng: 77.1025 },
+            activityType: "walking",
+            plannedDate: "2026-10-10",
+            plannedStartTime: "09:00",
+            plannedDurationMinutes: 60,
+            currentObservation: {
+                timestamp: new Date(Date.now() - 5 * 60 * 60 * 1000).toISOString(), // 5 hours ago
+                pm2_5: 45,
+                pm10: 80,
+            },
+            hourlyForecast: dummyForecast,
+        };
+        const decision = evaluateCampusDecision(input);
+        assert.ok(decision.reasonCodes.includes("OBSERVATION_STALE"));
+    });
+    await t.test("Handles missing forecast gracefully with FORECAST_UNAVAILABLE", () => {
+        const input = {
+            campusName: "BITS Pilani",
+            coordinates: { lat: 28.3639, lng: 75.587 },
+            activityType: "outdoor_events",
+            plannedDate: "2026-10-10",
+            plannedStartTime: "10:00",
+            plannedDurationMinutes: 120,
+            currentObservation: {
+                timestamp: new Date().toISOString(),
+                pm2_5: 35,
+                pm10: 70,
+            },
+            hourlyForecast: [], // Empty forecast
+        };
+        const decision = evaluateCampusDecision(input);
+        assert.ok(decision.reasonCodes.includes("FORECAST_UNAVAILABLE"));
+    });
+});
+test("Deterministic Bedrock Fallback Generator", async (t) => {
+    await t.test("Produces structured, grounded explanation without throwing", () => {
+        const dummyDecision = evaluateCampusDecision({
+            campusName: "IIT Delhi",
+            coordinates: { lat: 28.545, lng: 77.1926 },
+            activityType: "sports",
+            plannedDate: "2026-10-10",
+            plannedStartTime: "09:00",
+            plannedDurationMinutes: 60,
+            currentObservation: {
+                timestamp: new Date().toISOString(),
+                pm2_5: 120,
+                pm10: 250,
+            },
+        });
+        const fallback = generateDeterministicFallbackExplanation(dummyDecision, "Can we hold football practice?");
+        assert.ok(fallback.includes("Executive Summary"));
+        assert.ok(fallback.includes("Time Slot Analysis"));
+        assert.ok(fallback.includes("Operational Campus Actions"));
+        assert.ok(fallback.includes("Data Attribution & Caveats"));
+    });
+});
