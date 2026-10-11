@@ -1,0 +1,174 @@
+import { Request, Response } from "express";
+import { BedrockRuntimeClient, ConverseCommand } from "@aws-sdk/client-bedrock-runtime";
+import { env } from "../config/env.js";
+import { sendSuccess, sendError } from "../utils/response.js";
+
+// Initialize Bedrock Runtime Client
+function getBedrockClient() {
+  if (!env.AWS_ACCESS_KEY_ID || !env.AWS_SECRET_ACCESS_KEY) {
+    return null;
+  }
+  return new BedrockRuntimeClient({
+    region: env.AWS_REGION || "us-east-1",
+    credentials: {
+      accessKeyId: env.AWS_ACCESS_KEY_ID,
+      secretAccessKey: env.AWS_SECRET_ACCESS_KEY,
+    },
+  });
+}
+
+/**
+ * Builds the tailored System Prompt injecting live environmental metrics and strict guardrails.
+ */
+function buildSystemPrompt(telemetry: any) {
+  const {
+    campusName,
+    location = "Live Location",
+    aqi = "N/A",
+    status = "Unknown",
+    pm25 = "N/A",
+    pm10 = "N/A",
+    o3 = "N/A",
+    temp = "N/A",
+    humidity = "N/A",
+    wind = "N/A",
+    uv = "N/A",
+  } = telemetry || {};
+
+  const locationText =
+    typeof location === "string"
+      ? location
+      : location?.lat && location?.lng
+      ? `${Number(location.lat).toFixed(4)}°N, ${Number(location.lng).toFixed(4)}°E`
+      : "Active Telemetry Grid";
+
+  return `You are BreatheWise AI, an expert Environmental & Air Quality Health Advisor.
+Your mission is to provide actionable, evidence-based guidance based on real-time atmospheric telemetry to help people protect their lungs and optimize their daily routines.
+
+CURRENT LIVE ENVIRONMENTAL CONDITIONS:
+${campusName ? `- User Campus / Institution: ${campusName}\n` : ""}- Location / Coordinates: ${locationText}
+- Overall Air Quality Index (CPCB NAQI): ${aqi} (${status})
+- Fine Particulate Matter (PM2.5): ${pm25} µg/m³
+- Coarse Particulate Matter (PM10): ${pm10} µg/m³
+- Ground-Level Ozone (O₃): ${o3} µg/m³
+- Ambient Temperature: ${temp}
+- Relative Humidity: ${humidity}
+- Surface Wind: ${wind}
+- UV Radiation Index: ${uv}
+
+STRICT GUARDRAILS & CORE BEHAVIOR RULES:
+1. AIR QUALITY & ENVIRONMENTAL HEALTH ONLY:
+   You are an air intelligence specialist. You MUST ONLY discuss air quality, particulate pollution, smoke, smog, pollen, weather impact on breathing, ventilation (HEPA purifiers, windows), masks (N95/KN95/surgical), and safe outdoor activity windows.
+2. REFUSE UNRELATED / RANDOM TOPICS:
+   Do NOT behave like a generic conversational chatbot. If the user asks about coding, movies, gaming, math, history, dating, politics, or any topic unrelated to air, weather, or respiratory safety, politely reject the query with a message such as:
+   "I am BreatheWise's specialized Air Intelligence Advisor. I can only assist with air quality, pollution exposure, respiratory safety, and atmospheric conditions."
+3. GROUNDED IN TELEMETRY:
+   Always ground your answers in the live telemetry provided above. When recommending an action (e.g., whether to run, open windows, or wear an N95), explicitly reference the relevant current numbers (e.g. AQI ${aqi}, PM2.5 ${pm25} µg/m³).
+4. ACTIONABLE ADVICE:
+   Provide clear, practical next steps:
+   - Exercise: recommend safe times of day (avoid rush hour or midday peak ozone).
+   - Indoors: specify whether to crack windows for fresh air or seal and turn on air purifiers.
+   - Protection: recommend whether particulate filtration (N95 mask) is necessary.
+5. NO FORMAL CLINICAL DIAGNOSES:
+   Offer preventative lifestyle guidance, but remind users to consult a doctor or healthcare professional for acute medical emergencies. Keep your tone concise, scientific, empathetic, and clear.
+6. USER INSTITUTION & CAMPUS GROUNDING:
+   ${campusName ? `The user's registered institution is "${campusName}". Under NO circumstances call the user's campus "IIT Delhi" or any other name. Address their campus strictly as "${campusName}".` : `Do not assume or claim the user is at "IIT Delhi" or any specific campus unless explicitly mentioned by the user.`}`;
+}
+
+export async function askAirAssistant(req: Request, res: Response) {
+  try {
+    const { message, history = [], telemetry } = req.body;
+
+    if (!message || typeof message !== "string") {
+      return sendError(res, "Message query is required", 400);
+    }
+
+    const client = getBedrockClient();
+
+    // If AWS credentials are not yet set up in .env, return a helpful setup notice
+    if (!client) {
+      return sendSuccess(res, {
+        reply: `⚠️ AWS Bedrock credentials are not configured in your backend .env file yet. Please set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY in backend/.env to connect to your live AWS Bedrock model (Current AQI: ${telemetry?.aqi ?? 34}, PM2.5: ${telemetry?.pm25 ?? 8.1} µg/m³).`,
+        telemetryUsed: telemetry,
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    const systemPrompt = buildSystemPrompt(telemetry);
+
+    // Format conversation messages for AWS Bedrock Converse API
+    // Bedrock rules:
+    // 1. Must start with role: "user" (no initial bot welcome message)
+    // 2. Roles must strictly alternate: user -> assistant -> user -> assistant
+    const rawHistory = Array.isArray(history) ? history : [];
+    
+    // Find index of first user message to strip leading UI welcome messages
+    const firstUserIndex = rawHistory.findIndex((h: any) => h.sender === "user");
+    const validHistory = firstUserIndex !== -1 ? rawHistory.slice(firstUserIndex) : [];
+
+    const sanitizedHistory: Array<{ role: "user" | "assistant"; content: [{ text: string }] }> = [];
+
+    for (const h of validHistory) {
+      if (!h.text || typeof h.text !== "string" || !h.text.trim()) continue;
+      const role: "user" | "assistant" = h.sender === "user" ? "user" : "assistant";
+
+      // Prevent consecutive identical roles
+      const last = sanitizedHistory[sanitizedHistory.length - 1];
+      if (last && last.role === role) {
+        continue;
+      }
+
+      sanitizedHistory.push({
+        role,
+        content: [{ text: h.text }],
+      });
+    }
+
+    // Since the new turn is a user query, ensure the preceding message isn't also "user"
+    while (sanitizedHistory.length > 0 && sanitizedHistory[sanitizedHistory.length - 1].role === "user") {
+      sanitizedHistory.pop();
+    }
+
+    // Keep the most recent context (e.g., last 6 turns), ensuring it starts with "user"
+    let recentHistory = sanitizedHistory.slice(-6);
+    if (recentHistory.length > 0 && recentHistory[0].role !== "user") {
+      recentHistory = recentHistory.slice(1);
+    }
+
+    const formattedMessages = [
+      ...recentHistory,
+      {
+        role: "user" as const,
+        content: [{ text: message }],
+      },
+    ];
+
+    const command = new ConverseCommand({
+      modelId: env.AWS_BEDROCK_MODEL_ID || "amazon.nova-lite-v1:0",
+      system: [{ text: systemPrompt }],
+      messages: formattedMessages,
+      inferenceConfig: {
+        maxTokens: 600,
+        temperature: 0.3,
+      },
+    });
+
+    const response = await client.send(command);
+    const replyText =
+      response.output?.message?.content?.[0]?.text ||
+      "Unable to process environmental telemetry at this time.";
+
+    return sendSuccess(res, {
+      reply: replyText,
+      telemetryUsed: telemetry,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error: any) {
+    console.error("AWS Bedrock Assistant Error:", error);
+    return sendError(
+      res,
+      error.message || "Failed to generate AI response from AWS Bedrock",
+      500
+    );
+  }
+}
