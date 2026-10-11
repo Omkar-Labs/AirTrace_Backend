@@ -1,0 +1,33 @@
+name: Keep Render Backend Alive
+
+on:
+  schedule:
+    # Runs every 10 minutes
+    - cron: '*/10 * * * *'
+  # Allows manual triggering from the GitHub Actions tab for testing
+  workflow_dispatch:
+
+jobs:
+  ping:
+    name: Ping Health Endpoint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping Server
+        env:
+          # You can define RENDER_BACKEND_URL in GitHub Repo Settings -> Secrets and variables -> Actions
+          SERVER_URL: ${{ secrets.RENDER_BACKEND_URL }}
+        run: |
+          TARGET_URL="${SERVER_URL:-https://your-app-name.onrender.com}"
+          echo "Pinging ${TARGET_URL}/health at $(date -u)"
+          
+          # -f: Fail silently on HTTP errors
+          # -s -S: Silent mode but show errors
+          # -m 30: 30-second timeout
+          RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" -m 30 "${TARGET_URL}/health" || echo "FAILED")
+          
+          echo "HTTP Status: ${RESPONSE}"
+          if [ "${RESPONSE}" = "200" ]; then
+            echo "Server is awake and healthy!"
+          else
+            echo "Server returned status ${RESPONSE} (or could not connect)"
+          fi
