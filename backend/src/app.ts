@@ -4,6 +4,7 @@ import { env } from "./config/env.js";
 import apiRoutes from "./routes/index.js";
 import { notFoundHandler, errorHandler } from "./middleware/error.middleware.js";
 import { optionalAuthMiddleware } from "./middleware/auth.middleware.js";
+import { success } from "zod";
 
 export function createApp(): Express {
   const app = express();
@@ -31,6 +32,18 @@ export function createApp(): Express {
   // 404 & Error Handling Middlewares
   app.use(notFoundHandler);
   app.use(errorHandler);
+
+ // ─── Health Check Endpoint ──────────────────────────────────────
+app.get("/health", (req, res) => {
+  res.status(200).json({
+    status: "ok",
+    message: "BreatheWise / AirTrace API is healthy and operational",
+    timestamp: new Date().toISOString(),
+    uptime: `${Math.floor(process.uptime())}s`,
+    environment: process.env.NODE_ENV ,
+  });
+});
+
 
   return app;
 }
