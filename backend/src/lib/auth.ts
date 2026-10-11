@@ -11,8 +11,6 @@ export const auth = betterAuth({
   baseURL: env.BETTER_AUTH_URL,
   trustedOrigins: [
     env.FRONTEND_URL,
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
   ],
   user: {
     additionalFields: {
@@ -69,11 +67,16 @@ export const auth = betterAuth({
     },
   },
   advanced: {
-    defaultCookieAttributes: {
-      sameSite: "lax",
-      secure: process.env.NODE_ENV === "production",
-      httpOnly: true,
-      path: "/",
+    useSecureCookies: true,
+    cookies: {
+      session_token: {
+        attributes: {
+          sameSite: "none",
+          secure: true,
+          httpOnly: true,
+          path: "/",
+        },
+      },
     },
   },
 });
